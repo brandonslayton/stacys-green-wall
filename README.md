@@ -1,10 +1,8 @@
 # Stacy's Green Wall
 
-Playable living-wall + soft neon diamond for **Stacy's @ Melrose**.
+Standalone playable — **not** part of stacys-model.
 
-- Leaves grow over the sign over time  
-- Swipe them clear with your finger  
-- More coverage → darker scene  
+Living wall + soft neon diamond. Leaves grow over the sign; swipe them clear; more coverage darkens the scene.
 
 ## Live
 
@@ -13,12 +11,19 @@ Playable living-wall + soft neon diamond for **Stacy's @ Melrose**.
 ## Local
 
 ```bash
-# any static server
+cd stacys-green-wall
 python -m http.server 8091
-# open http://localhost:8091/
+# http://localhost:8091/
 ```
 
-## Source
+## Files
 
-Logic lives in `js/greenWall.js`. Shared venue model remains in
-[stacys-model](https://github.com/brandonslayton/stacys-model).
+| Path | Role |
+|------|------|
+| `index.html` | Playable workbench |
+| `js/greenWall.js` | Leaves, sign, overgrowth sim |
+| `js/kit.js` | Tiny Three helpers (this site only) |
+| `js/brand.js` | Font stacks |
+| `images/` | Optional brand assets |
+
+No dependency on the venue model repo.
