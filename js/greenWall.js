@@ -835,23 +835,27 @@ export function buildStacysNeonDiamond(nightMats, opts = {}) {
 }
 
 /**
- * Interactive overgrowth leaves that creep over the diamond over time.
- * User can drag/swipe them aside; they slowly grow back.
+ * Overgrowth leaves: full-diamond cover (edges + tips), finger brush → fall,
+ * recycled leaves keep growing back. Camera-independent sim.
  *
- * @returns {{ group, tick, getCoverage, pickLeaf, dragLeaf, endDrag, reset }}
+ * Cover targets are stratified across the diamond so corners/edges aren't bare.
+ * state: growing | covered | falling
  */
 export function createSignOvergrowth(opts = {}) {
   const group = new THREE.Group();
   group.name = "signOvergrowth";
 
-  const count = opts.count ?? 36;
+  const count = opts.count ?? 64;
   const faceW = opts.faceW ?? 1.02;
   const faceH = opts.faceH ?? 0.74;
   const leafScale = opts.leafScale ?? 0.7;
   const rnd = makeRnd(opts.seed ?? 404);
-  const growSeconds = opts.growSeconds ?? 48; // full creep if left alone
-  const regrowRate = opts.regrowRate ?? 0.08; // clearAmt decay per second
+  const growSeconds = opts.growSeconds ?? 36;
   const signY = opts.signY ?? 0.1;
+  const halfW = faceW * 0.5;
+  const halfH = faceH * 0.5;
+  // Slightly larger than face so rims/tips stay covered
+  const coverPad = 1.12;
 
   const pickCol = () => {
     const u = rnd();
@@ -860,127 +864,284 @@ export function createSignOvergrowth(opts = {}) {
     return LEAF_COLORS[Math.floor(rnd() * LEAF_COLORS.length)];
   };
 
-  /** @type {{ mesh: THREE.Group, cover: THREE.Vector3, edge: THREE.Vector3, clear: number, weight: number, phase: number, dragOffset: THREE.Vector3 }[]} */
+  /** Diamond metric: 0 center → 1 edge (axis-aligned diamond). */
+  function diamondT(lx, ly) {
+    return Math.abs(lx) / (halfW * coverPad) + Math.abs(ly - signY) / (halfH * coverPad);
+  }
+
+  /** Stratified cover slots — fill diamond including tips & side lobes. */
+  function makeCoverSlots(n) {
+    const slots = [];
+    // Explicit tip + edge anchors first (were going bare)
+    const anchors = [
+      [0, signY + halfH * 1.05],
+      [0, signY - halfH * 1.05],
+      [halfW * 1.05, signY],
+      [-halfW * 1.05, signY],
+      [halfW * 0.72, signY + halfH * 0.72],
+      [-halfW * 0.72, signY + halfH * 0.72],
+      [halfW * 0.72, signY - halfH * 0.72],
+      [-halfW * 0.72, signY - halfH * 0.72],
+      [halfW * 0.45, signY + halfH * 0.9],
+      [-halfW * 0.45, signY + halfH * 0.9],
+      [halfW * 0.45, signY - halfH * 0.9],
+      [-halfW * 0.45, signY - halfH * 0.9],
+      [halfW * 0.9, signY + halfH * 0.4],
+      [-halfW * 0.9, signY + halfH * 0.4],
+      [halfW * 0.9, signY - halfH * 0.4],
+      [-halfW * 0.9, signY - halfH * 0.4],
+    ];
+    for (const [x, y] of anchors) {
+      slots.push(new THREE.Vector3(x, y, 0.12 + rnd() * 0.05));
+    }
+    // Grid fill inside diamond (biased toward edges: reject too-center)
+    const cols = 9;
+    const rows = 8;
+    let guard = 0;
+    while (slots.length < n && guard < n * 20) {
+      guard++;
+      const gx = (rnd() - 0.5) * 2;
+      const gy = (rnd() - 0.5) * 2;
+      const lx = gx * halfW * coverPad;
+      const ly = signY + gy * halfH * coverPad;
+      const t = diamondT(lx, ly);
+      if (t > 1.05) continue; // outside diamond
+      // Prefer mid/edge: soft reject pure center so tips get more leaves
+      if (t < 0.18 && rnd() > 0.25) continue;
+      slots.push(
+        new THREE.Vector3(lx + (rnd() - 0.5) * 0.04, ly + (rnd() - 0.5) * 0.03, 0.11 + rnd() * 0.07)
+      );
+    }
+    // Pad if short
+    while (slots.length < n) {
+      const a = rnd() * Math.PI * 2;
+      const r = 0.55 + rnd() * 0.5;
+      slots.push(
+        new THREE.Vector3(
+          Math.cos(a) * r * halfW * coverPad,
+          signY + Math.sin(a) * r * halfH * coverPad,
+          0.12 + rnd() * 0.05
+        )
+      );
+    }
+    return slots.slice(0, n);
+  }
+
+  function makeEdgeFromCover(cover) {
+    // Spawn outside, along ray from sign center through cover
+    const cx = cover.x;
+    const cy = cover.y - signY;
+    const len = Math.hypot(cx, cy) || 0.01;
+    const scale = 1.55 + rnd() * 0.45;
+    return new THREE.Vector3(
+      (cx / len) * halfW * coverPad * scale,
+      signY + (cy / len) * halfH * coverPad * scale,
+      0.08 + rnd() * 0.04
+    );
+  }
+
+  const coverSlots = makeCoverSlots(count);
+  /** @type {object[]} */
   const leaves = [];
 
-  for (let i = 0; i < count; i++) {
-    const s = (0.09 + rnd() * 0.14) * leafScale;
-    const mesh = makeDetailedLeaf(s, pickCol(), i % 4, rnd, { curl: false });
+  function tagLeaf(mesh, index) {
     mesh.name = "overgrowthLeaf";
-    // Mark for raycast — pick first mesh child
+    mesh.userData.leafIndex = index;
+    mesh.userData.overgrowth = true;
     mesh.traverse((o) => {
       if (o.isMesh) {
         o.userData.overgrowth = true;
-        o.userData.leafIndex = i;
+        o.userData.leafIndex = index;
       }
     });
+  }
 
-    // Approach direction: mostly from edges/corners toward sign center
-    const ang = (i / count) * Math.PI * 2 + rnd() * 0.4;
-    const edgeR = 0.55 + rnd() * 0.35; // start off the face
-    const coverR = 0.04 + rnd() * 0.38; // end position over the face
-    const edge = new THREE.Vector3(
-      Math.cos(ang) * edgeR * faceW * 0.95,
-      signY + Math.sin(ang) * edgeR * faceH * 0.95,
-      0.11 + rnd() * 0.06
-    );
-    const cover = new THREE.Vector3(
-      Math.cos(ang) * coverR * faceW * 0.85 + (rnd() - 0.5) * 0.08,
-      signY + Math.sin(ang) * coverR * faceH * 0.85 + (rnd() - 0.5) * 0.06,
-      0.13 + rnd() * 0.08
-    );
-
-    // Stagger: some leaves start more covered so scene isn't empty
-    const startClear = 0.55 + rnd() * 0.4; // 1 = fully cleared/off, 0 = fully covering
-    const weight = 0.6 + rnd() * 0.8; // contribution to darkness
-    const phase = rnd() * Math.PI * 2;
-
-    mesh.position.copy(edge).lerp(cover, 1 - startClear);
-    mesh.rotation.z = ang + Math.PI / 2 + (rnd() - 0.5) * 0.8;
-    mesh.rotation.x = (rnd() - 0.5) * 0.5;
-    mesh.rotation.y = (rnd() - 0.5) * 0.4;
-    mesh.scale.setScalar(0.85 + rnd() * 0.35);
-
+  function spawnLeaf(index, cover, startProgress) {
+    const s = (0.1 + rnd() * 0.13) * leafScale;
+    const mesh = makeDetailedLeaf(s, pickCol(), index % 4, rnd, { curl: false });
+    tagLeaf(mesh, index);
+    const edge = makeEdgeFromCover(cover);
+    const progress = startProgress ?? 0; // 0 = at edge, 1 = on cover
+    mesh.position.copy(edge).lerp(cover, progress);
+    const ang = Math.atan2(cover.y - signY, cover.x);
+    mesh.rotation.z = ang + Math.PI / 2 + (rnd() - 0.5) * 0.9;
+    mesh.rotation.x = (rnd() - 0.5) * 0.45;
+    mesh.rotation.y = (rnd() - 0.5) * 0.35;
+    mesh.scale.setScalar(0.8 + rnd() * 0.4);
     group.add(mesh);
-    leaves.push({
+    return {
       mesh,
       cover: cover.clone(),
       edge: edge.clone(),
-      clear: startClear,
-      weight,
-      phase,
-      dragOffset: new THREE.Vector3(),
+      progress, // grow onto cover
+      growSpeed: 0.35 + rnd() * 0.55, // progress units / sec at full global growth
+      weight: 0.55 + rnd() * 0.9,
+      phase: rnd() * Math.PI * 2,
       baseRotZ: mesh.rotation.z,
-    });
+      state: "growing", // growing | covered | falling
+      vx: 0,
+      vy: 0,
+      vz: 0,
+      spinX: 0,
+      spinZ: 0,
+      fallT: 0,
+    };
   }
 
-  let growth = 0.15; // global creep 0..1
-  let dragging = null; // leaf index
-  const _tmp = new THREE.Vector3();
+  for (let i = 0; i < count; i++) {
+    // Start partially grown so edges already have some cover
+    const p0 = 0.15 + rnd() * 0.55;
+    leaves.push(spawnLeaf(i, coverSlots[i], p0));
+  }
 
-  function applyLeafPose(L, tGrowth) {
-    // effective cover strength: growth pulls toward cover, clear pushes toward edge
-    const creep = Math.min(1, Math.max(0, tGrowth));
-    // clear=1 → at edge; clear=0 → at cover (when growth high)
-    const towardCover = creep * (1 - L.clear);
-    _tmp.copy(L.edge).lerp(L.cover, towardCover);
-    _tmp.add(L.dragOffset);
+  let growth = 0.35; // global creep 0..1
+  const _tmp = new THREE.Vector3();
+  const GRAVITY = -4.2;
+  const FALL_Y = signY - 1.6;
+
+  function applyGrowingPose(L) {
+    const creep = Math.min(1, Math.max(0, growth));
+    const p = Math.min(1, L.progress * creep + L.progress * (1 - creep) * 0.35);
+    // When growth high, progress maps fully; when low, still partial
+    const t = L.progress * (0.25 + 0.75 * creep);
+    _tmp.copy(L.edge).lerp(L.cover, Math.min(1, t));
     L.mesh.position.copy(_tmp);
-    // flutter
-    L.mesh.rotation.z = L.baseRotZ + Math.sin(performance.now() * 0.0015 + L.phase) * 0.04 * (1 - L.clear * 0.5);
+    L.mesh.rotation.z =
+      L.baseRotZ + Math.sin(performance.now() * 0.0015 + L.phase) * 0.05;
+    L.mesh.visible = true;
+    if (t >= 0.92) L.state = "covered";
+    else L.state = "growing";
   }
 
   function getCoverage() {
-    // How much leaves are actually sitting over the sign face
     let sum = 0;
     let wsum = 0;
     for (const L of leaves) {
-      const towardCover = growth * (1 - L.clear);
-      // drag away reduces coverage
-      const dragAway = Math.min(1, L.dragOffset.length() / 0.45);
-      const c = Math.max(0, towardCover * (1 - dragAway * 0.85));
-      sum += c * L.weight;
       wsum += L.weight;
+      if (L.state === "falling") continue;
+      const t = Math.min(1, L.progress);
+      // Extra weight if slot is on diamond edge (edge coverage matters more)
+      const edgeBoost = diamondT(L.cover.x, L.cover.y) > 0.55 ? 1.25 : 1;
+      sum += t * L.weight * edgeBoost;
     }
-    return wsum > 0 ? Math.min(1, sum / wsum) : 0;
+    return wsum > 0 ? Math.min(1, sum / (wsum * 1.05)) : 0;
+  }
+
+  function releaseLeaf(L, swipeVx = 0, swipeVy = 0) {
+    if (L.state === "falling") return;
+    L.state = "falling";
+    L.fallT = 0;
+    // Kick from finger motion + slight outward push from center
+    const ox = L.mesh.position.x;
+    const oy = L.mesh.position.y - signY;
+    const olen = Math.hypot(ox, oy) || 1;
+    L.vx = swipeVx * 8 + (ox / olen) * (0.6 + rnd() * 0.8) + (rnd() - 0.5) * 0.4;
+    L.vy = swipeVy * 8 + 0.3 + rnd() * 0.8;
+    L.vz = 0.4 + rnd() * 0.9;
+    L.spinX = (rnd() - 0.5) * 10;
+    L.spinZ = (rnd() - 0.5) * 14;
+  }
+
+  function recycleLeaf(L, index) {
+    // New cover slot: prefer edges that look sparse
+    let best = null;
+    let bestScore = -1;
+    for (let k = 0; k < 12; k++) {
+      const slot = coverSlots[Math.floor(rnd() * coverSlots.length)].clone();
+      slot.x += (rnd() - 0.5) * 0.06;
+      slot.y += (rnd() - 0.5) * 0.05;
+      // Score: want high diamondT (edge) and few nearby covered leaves
+      let near = 0;
+      for (const O of leaves) {
+        if (O === L || O.state === "falling") continue;
+        if (O.mesh.position.distanceTo(slot) < 0.18) near++;
+      }
+      const score = diamondT(slot.x, slot.y) * 2 - near + rnd() * 0.3;
+      if (score > bestScore) {
+        bestScore = score;
+        best = slot;
+      }
+    }
+    L.cover.copy(best || coverSlots[index % coverSlots.length]);
+    L.edge.copy(makeEdgeFromCover(L.cover));
+    L.progress = 0;
+    L.growSpeed = 0.4 + rnd() * 0.7;
+    L.state = "growing";
+    L.vx = L.vy = L.vz = 0;
+    L.fallT = 0;
+    L.phase = rnd() * Math.PI * 2;
+    const ang = Math.atan2(L.cover.y - signY, L.cover.x);
+    L.baseRotZ = ang + Math.PI / 2 + (rnd() - 0.5) * 0.9;
+    L.mesh.position.copy(L.edge);
+    L.mesh.rotation.set((rnd() - 0.5) * 0.4, (rnd() - 0.5) * 0.3, L.baseRotZ);
+    L.mesh.scale.setScalar(0.75 + rnd() * 0.45);
+    L.mesh.visible = true;
+    // Fresh leaf color variety
+    L.mesh.traverse((o) => {
+      if (o.isMesh && o.material?.color) {
+        o.material.color.setHex(pickCol());
+      }
+    });
   }
 
   function tick(dt) {
-    // Global growth creeps up over growSeconds
     growth = Math.min(1, growth + dt / growSeconds);
-    for (const L of leaves) {
-      // Slowly regrow (lose clear) unless being dragged
-      if (dragging === null || leaves[dragging] !== L) {
-        L.clear = Math.max(0, L.clear - regrowRate * dt * (0.7 + 0.6 * growth));
-        // drag offset springs home
-        L.dragOffset.multiplyScalar(Math.exp(-1.8 * dt));
-        if (L.dragOffset.lengthSq() < 1e-6) L.dragOffset.set(0, 0, 0);
+
+    for (let i = 0; i < leaves.length; i++) {
+      const L = leaves[i];
+      if (L.state === "falling") {
+        L.fallT += dt;
+        L.vy += GRAVITY * dt;
+        L.mesh.position.x += L.vx * dt;
+        L.mesh.position.y += L.vy * dt;
+        L.mesh.position.z += L.vz * dt;
+        L.mesh.rotation.x += L.spinX * dt;
+        L.mesh.rotation.z += L.spinZ * dt;
+        // Slight air drag
+        L.vx *= Math.exp(-0.6 * dt);
+        L.vz *= Math.exp(-0.4 * dt);
+        if (L.mesh.position.y < FALL_Y || L.fallT > 2.8) {
+          recycleLeaf(L, i);
+        }
+        continue;
       }
-      applyLeafPose(L, growth);
+
+      // Grow onto cover
+      const rate = L.growSpeed * (0.35 + 0.9 * growth) * dt;
+      L.progress = Math.min(1, L.progress + rate);
+      applyGrowingPose(L);
     }
     return getCoverage();
+  }
+
+  /**
+   * Brush at local plane point (x,y). Knocks off nearby covering leaves.
+   * swipeVx/Vy in local units/sec-ish (frame deltas work).
+   */
+  function brushAt(lx, ly, swipeVx = 0, swipeVy = 0, radius = 0.22) {
+    let hit = 0;
+    const speed = Math.hypot(swipeVx, swipeVy);
+    const r = radius + Math.min(0.12, speed * 0.8);
+    for (const L of leaves) {
+      if (L.state === "falling") continue;
+      if (L.progress < 0.12) continue; // still off-edge, ignore
+      const dx = L.mesh.position.x - lx;
+      const dy = L.mesh.position.y - ly;
+      if (dx * dx + dy * dy <= r * r) {
+        releaseLeaf(L, swipeVx, swipeVy);
+        hit++;
+      }
+    }
+    return hit;
   }
 
   function pickLeaf(raycaster) {
     const hits = raycaster.intersectObjects(group.children, true);
     for (const h of hits) {
-      let o = h.object;
-      while (o && o.userData.leafIndex === undefined) o = o.parent;
-      if (o && o.userData.leafIndex !== undefined) {
-        return { index: o.userData.leafIndex, point: h.point.clone() };
-      }
-      // mesh may store on itself
-      if (h.object.userData.leafIndex !== undefined) {
-        return { index: h.object.userData.leafIndex, point: h.point.clone() };
-      }
-    }
-    // also check group children's userData via traverse store
-    for (const h of hits) {
       let p = h.object;
       while (p) {
-        if (p.name === "overgrowthLeaf") {
-          const idx = leaves.findIndex((L) => L.mesh === p);
-          if (idx >= 0) return { index: idx, point: h.point.clone() };
+        if (p.userData?.leafIndex !== undefined) {
+          return { index: p.userData.leafIndex, point: h.point.clone() };
         }
         p = p.parent;
       }
@@ -988,46 +1149,24 @@ export function createSignOvergrowth(opts = {}) {
     return null;
   }
 
-  function beginDrag(index) {
-    dragging = index;
-  }
-
-  function dragLeaf(index, worldDelta) {
-    const L = leaves[index];
-    if (!L) return;
-    // Push leaf outward from sign center in XY
-    L.dragOffset.x += worldDelta.x;
-    L.dragOffset.y += worldDelta.y;
-    // Clamp how far you can fling
-    const maxD = 0.85;
-    if (L.dragOffset.length() > maxD) L.dragOffset.setLength(maxD);
-    // Swiping clears it
-    const away = L.dragOffset.length();
-    L.clear = Math.min(1, L.clear + away * 0.08 + 0.04);
-    applyLeafPose(L, growth);
-  }
-
-  function endDrag() {
-    dragging = null;
-  }
-
-  function reset() {
-    growth = 0.12;
+  function clearAll() {
     for (const L of leaves) {
-      L.clear = 0.6 + Math.random() * 0.35;
-      L.dragOffset.set(0, 0, 0);
-      applyLeafPose(L, growth);
+      if (L.state !== "falling") {
+        releaseLeaf(L, (rnd() - 0.5) * 0.4, 0.2 + rnd() * 0.3);
+      }
     }
   }
 
-  // Initial poses
-  for (const L of leaves) applyLeafPose(L, growth);
-
-  // Store leafIndex on mesh root for picking
-  leaves.forEach((L, i) => {
-    L.mesh.userData.leafIndex = i;
-    L.mesh.userData.overgrowth = true;
-  });
+  function reset() {
+    growth = 0.3;
+    for (let i = 0; i < leaves.length; i++) {
+      const L = leaves[i];
+      L.state = "growing";
+      L.progress = 0.2 + rnd() * 0.5;
+      L.vx = L.vy = L.vz = 0;
+      applyGrowingPose(L);
+    }
+  }
 
   return {
     group,
@@ -1035,11 +1174,15 @@ export function createSignOvergrowth(opts = {}) {
     tick,
     getCoverage,
     pickLeaf,
-    beginDrag,
-    dragLeaf,
-    endDrag,
+    brushAt,
+    releaseLeaf,
+    clearAll,
     reset,
     getGrowth: () => growth,
+    // legacy no-ops so old HTML doesn't break mid-deploy
+    beginDrag() {},
+    dragLeaf() {},
+    endDrag() {},
   };
 }
 
@@ -1080,12 +1223,12 @@ export function buildGreenWallWithNeon(nightMats = [], opts = {}) {
   let overgrowth = null;
   if (opts.overgrowth === true) {
     overgrowth = createSignOvergrowth({
-      count: opts.overgrowthCount ?? 38,
+      count: opts.overgrowthCount ?? 68,
       faceW,
       faceH,
       leafScale: (opts.leafScale ?? P.leafScale) * 1.05,
       signY,
-      growSeconds: opts.growSeconds ?? 45,
+      growSeconds: opts.growSeconds ?? 32,
       seed: (opts.seed ?? 107) + 50,
     });
     // Place slightly in front of sign face
