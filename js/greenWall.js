@@ -1000,17 +1000,14 @@ export function createSignOvergrowth(opts = {}) {
   const FALL_Y = signY - 1.6;
 
   function applyGrowingPose(L) {
-    const creep = Math.min(1, Math.max(0, growth));
-    const p = Math.min(1, L.progress * creep + L.progress * (1 - creep) * 0.35);
-    // When growth high, progress maps fully; when low, still partial
-    const t = L.progress * (0.25 + 0.75 * creep);
-    _tmp.copy(L.edge).lerp(L.cover, Math.min(1, t));
+    // progress 0 = off edge, 1 = locked on cover slot (full diamond, including tips)
+    const t = Math.min(1, Math.max(0, L.progress));
+    _tmp.copy(L.edge).lerp(L.cover, t);
     L.mesh.position.copy(_tmp);
     L.mesh.rotation.z =
       L.baseRotZ + Math.sin(performance.now() * 0.0015 + L.phase) * 0.05;
     L.mesh.visible = true;
-    if (t >= 0.92) L.state = "covered";
-    else L.state = "growing";
+    L.state = t >= 0.92 ? "covered" : "growing";
   }
 
   function getCoverage() {
